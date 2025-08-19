@@ -1,0 +1,23 @@
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy drop;
+                iif "lo" accept
+                ct state established,related accept
+                ip protocol icmp accept
+                ip6 nexthdr ipv6-icmp accept
+                tcp dport 22 accept
+                tcp dport 80 accept
+                tcp dport 443 accept
+                tcp dport 10050 accept
+                tcp dport 10051 accept
+                counter packets 89 bytes 9327 drop
+        }
+
+        chain forward {
+                type filter hook forward priority filter; policy drop;
+        }
+
+        chain output {
+                type filter hook output priority filter; policy accept;
+        }
+}

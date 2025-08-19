@@ -1,0 +1,998 @@
+================================================================================
+ZABBIX 7.0 MONITORING SYSTEM - COMPLETE INSTALLATION GUIDE
+Rocky Linux 9.x with PostgreSQL, nftables and Matrix Integration
+================================================================================
+
+================================================================================
+SECTION 1: ZABBIX SERVER INSTALLATION
+================================================================================
+
+1.1 SYSTEM PREPARATION
+----------------------
+dnf install epel-release -y
+dnf remove firewalld firewalld-filesystem -y
+systemctl enable nftables
+systemctl start nftables
+
+1.2 NFTABLES CONFIGURATION
+--------------------------
+cat > /etc/nftables/zabbix.nft << 'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+        tcp dport 22 accept
+        tcp dport 80 accept
+        tcp dport 443 accept
+        tcp dport 10050 accept
+        tcp dport 10051 accept
+        counter drop
+    }
+    
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+    
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+
+nft -f /etc/nftables/zabbix.nft
+cp /etc/nftables/zabbix.nft /etc/sysconfig/nftables.conf
+systemctl restart nftables
+
+1.3 POSTGRESQL 16 INSTALLATION
+-------------------------------
+dnf module install postgresql:16/server -y
+/usr/bin/postgresql-setup --initdb
+systemctl start postgresql
+systemctl enable postgresql
+
+1.4 POSTGRESQL CONFIGURATION
+-----------------------------
+sudo -u postgres psql -c "ALTER USER postgres PASSWORD '[YOUR_POSTGRES_PASSWORD]';"
+systemctl stop postgresql
+
+sed -i 's/peer$/scram-sha-256/g' /var/lib/pgsql/data/pg_hba.conf
+sed -i 's/ident$/scram-sha-256/g' /var/lib/pgsql/data/pg_hba.conf
+sed -i 's/md5$/scram-sha-256/g' /var/lib/pgsql/data/pg_hba.conf
+
+echo "password_encryption = scram-sha-256" >> /var/lib/pgsql/data/postgresql.conf
+systemctl start postgresql
+
+1.5 WEBSTACK INSTALLATION
+--------------------------
+dnf install nginx php php-fpm php-pgsql php-ldap php-bcmath php-mbstring php-gd php-pdo php-xml php-json -y
+systemctl start nginx php-fpm
+systemctl enable nginx php-fpm
+
+1.6 ZABBIX INSTALLATION
+------------------------
+dnf install zabbix7.0-server-pgsql zabbix7.0-web-pgsql zabbix7.0-agent zabbix7.0-dbfiles-pgsql zabbix7.0-selinux -y
+
+1.7 ZABBIX DATABASE SETUP
+--------------------------
+systemctl stop postgresql
+cp /var/lib/pgsql/data/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf.backup
+sed -i 's/scram-sha-256/trust/g' /var/lib/pgsql/data/pg_hba.conf
+systemctl start postgresql
+
+sudo -u postgres createuser zabbix --pwprompt
+# Enter password: [YOUR_ZABBIX_DB_PASSWORD]
+sudo -u postgres createdb -O zabbix -E UTF8 zabbix
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE zabbix TO zabbix;"
+
+sudo -u zabbix psql zabbix < /usr/share/zabbix-postgresql/schema.sql
+sudo -u zabbix psql zabbix < /usr/share/zabbix-postgresql/images.sql
+sudo -u zabbix psql zabbix < /usr/share/zabbix-postgresql/data.sql
+
+cp /var/lib/pgsql/data/pg_hba.conf.backup /var/lib/pgsql/data/pg_hba.conf
+systemctl restart postgresql
+
+1.8 PHP CONFIGURATION
+---------------------
+sed -i 's/post_max_size = 8M/post_max_size = 32M/' /etc/php.ini
+sed -i 's/max_execution_time = 30/max_execution_time = 300/' /etc/php.ini
+sed -i 's/max_input_time = 60/max_input_time = 300/' /etc/php.ini
+sed -i 's/;post_max_size = 8M/post_max_size = 32M/' /etc/php.ini
+sed -i 's/;max_execution_time = 30/max_execution_time = 300/' /etc/php.ini
+sed -i 's/;max_input_time = 60/max_input_time = 300/' /etc/php.ini
+systemctl restart php-fpm
+
+1.9 NGINX CONFIGURATION
+------------------------
+cat > /etc/nginx/conf.d/zabbix.conf << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/zabbix;
+    index index.php;
+
+    location = /favicon.ico {
+        log_not_found off;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location /api {
+        try_files $uri $uri/ /api/index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php-fpm/www.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_param QUERY_STRING $query_string;
+        fastcgi_param REQUEST_METHOD $request_method;
+        fastcgi_param CONTENT_TYPE $content_type;
+        fastcgi_param CONTENT_LENGTH $content_length;
+        fastcgi_intercept_errors on;
+        fastcgi_ignore_client_abort off;
+        fastcgi_connect_timeout 60;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 4 256k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    location ~* \.(jpg|jpeg|gif|png|css|js|ico|xml)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        log_not_found off;
+    }
+}
+EOF
+
+nginx -t
+systemctl reload nginx
+
+1.10 SELINUX CONFIGURATION
+---------------------------
+setsebool -P httpd_can_network_connect_db 1
+setsebool -P httpd_can_connect_zabbix 1
+setsebool -P httpd_can_network_connect 1
+setsebool -P zabbix_can_network 1
+setsebool -P httpd_unified 1
+restorecon -R /usr/share/zabbix/
+restorecon -R /etc/zabbix/
+setenforce 1
+
+1.11 ZABBIX SERVER CONFIGURATION
+---------------------------------
+mkdir -p /var/log/zabbix /run/zabbix
+chown zabbix:zabbix /var/log/zabbix /run/zabbix
+chmod 755 /var/log/zabbix /run/zabbix
+
+sed -i 's/# DBPassword=/DBPassword=[YOUR_ZABBIX_DB_PASSWORD]/' /etc/zabbix_server.conf
+echo "LogFile=/var/log/zabbix/zabbix_server.log" >> /etc/zabbix_server.conf
+echo "PidFile=/run/zabbix/zabbix_server.pid" >> /etc/zabbix_server.conf
+chown zabbix:zabbix /etc/zabbix_server.conf
+chmod 644 /etc/zabbix_server.conf
+
+1.12 SYSTEMD SERVICE FIX
+------------------------
+mkdir -p /etc/systemd/system/zabbix-server-pgsql.service.d/
+cat > /etc/systemd/system/zabbix-server-pgsql.service.d/override.conf << 'EOF'
+[Service]
+User=zabbix
+Group=zabbix
+PIDFile=/run/zabbix/zabbix_server.pid
+RuntimeDirectory=zabbix
+RuntimeDirectoryMode=0755
+EOF
+
+systemctl daemon-reload
+systemctl start zabbix-server-pgsql zabbix-agent nginx php-fpm postgresql
+systemctl enable zabbix-server-pgsql zabbix-agent nginx php-fpm postgresql
+
+1.13 SSL CERTIFICATE CREATION
+------------------------------
+mkdir -p /etc/nginx/ssl
+cd /etc/nginx/ssl
+
+openssl req -new -x509 -days 3650 -nodes \
+  -out zabbix.crt -keyout zabbix.key \
+  -subj "/C=DE/ST=NRW/L=Cologne/O=HomeNetwork/OU=IT/CN=[YOUR_SERVER_IP]"
+
+chmod 600 zabbix.key
+chmod 644 zabbix.crt
+restorecon -Rv /etc/nginx/ssl/
+
+1.14 HTTPS CONFIGURATION
+-------------------------
+cp /etc/nginx/conf.d/zabbix.conf /etc/nginx/conf.d/zabbix.conf.backup
+
+cat > /etc/nginx/conf.d/zabbix.conf << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name _;
+    
+    ssl_certificate /etc/nginx/ssl/zabbix.crt;
+    ssl_certificate_key /etc/nginx/ssl/zabbix.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+    ssl_prefer_server_ciphers on;
+    
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    
+    root /usr/share/zabbix;
+    index index.php;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location /api {
+        try_files $uri $uri/ /api/index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php-fpm/www.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_param HTTPS on;
+        fastcgi_param REQUEST_SCHEME https;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+setsebool -P httpd_can_network_connect 1
+semanage fcontext -a -t cert_t "/etc/nginx/ssl(/.*)?"
+restorecon -Rv /etc/nginx/ssl/
+
+nginx -t
+systemctl restart nginx
+
+1.15 ZABBIX SERVER PSK SETUP
+-----------------------------
+openssl rand -hex 32 | tee /etc/zabbix/zabbix_agentd.psk
+# Save this PSK key: [PSK_KEY_WILL_BE_DISPLAYED]
+
+chown zabbix:zabbix /etc/zabbix/zabbix_agentd.psk
+chmod 600 /etc/zabbix/zabbix_agentd.psk
+
+cp /etc/zabbix_agentd.conf /etc/zabbix_agentd.conf.backup
+
+tee -a /etc/zabbix_agentd.conf <<'EOF'
+
+### ENCRYPTION SETTINGS ###
+TLSConnect=psk
+TLSAccept=psk
+TLSPSKIdentity=ZabbixServer-PSK
+TLSPSKFile=/etc/zabbix/zabbix_agentd.psk
+EOF
+
+systemctl restart zabbix-agent
+
+================================================================================
+SECTION 2: CLIENT CONFIGURATION
+================================================================================
+
+2.1 ZABBIX AGENT INSTALLATION
+------------------------------
+dnf install epel-release -y
+dnf install zabbix7.0-agent -y
+
+cp /etc/zabbix_agentd.conf /etc/zabbix_agentd.conf.backup
+
+sed -i 's/Server=127.0.0.1/Server=[ZABBIX_SERVER_IP]/' /etc/zabbix_agentd.conf
+sed -i 's/ServerActive=127.0.0.1/ServerActive=[ZABBIX_SERVER_IP]/' /etc/zabbix_agentd.conf
+
+HOSTNAME=$(hostname)
+sed -i "s/Hostname=Zabbix server/Hostname=$HOSTNAME/" /etc/zabbix_agentd.conf
+
+2.2 CLIENT FIREWALL
+-------------------
+dnf remove firewalld firewalld-filesystem -y
+dnf install nftables -y
+
+tee /etc/sysconfig/nftables.conf << 'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+        tcp dport 22 accept
+        ip saddr [ZABBIX_SERVER_IP] tcp dport 10050 accept
+        counter drop
+    }
+    
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+    
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+
+systemctl enable nftables
+systemctl start nftables
+
+2.3 CLIENT PSK SETUP
+--------------------
+openssl rand -hex 32 | tee /etc/zabbix/zabbix_agentd.psk
+# Save this PSK key: [PSK_KEY_WILL_BE_DISPLAYED]
+
+chown zabbix:zabbix /etc/zabbix/zabbix_agentd.psk
+chmod 600 /etc/zabbix/zabbix_agentd.psk
+
+cp /etc/zabbix_agentd.conf /etc/zabbix_agentd.conf.backup
+
+tee -a /etc/zabbix_agentd.conf <<'EOF'
+
+### ENCRYPTION SETTINGS ###
+TLSConnect=psk
+TLSAccept=psk
+TLSPSKIdentity=[HOSTNAME]-PSK
+TLSPSKFile=/etc/zabbix/zabbix_agentd.psk
+EOF
+
+systemctl restart zabbix-agent
+
+================================================================================
+SECTION 3: MONITORING USE CASES
+================================================================================
+
+3.1 USER SESSION MONITORING
+----------------------------
+mkdir -p /etc/zabbix/zabbix_agentd.d/
+
+tee /etc/zabbix/zabbix_agentd.d/user-session-monitoring.conf <<'EOF'
+UserParameter=user.session.toolong,who | while read user tty rest; do login_pid=$(ps aux | grep -E "sshd:.*$user|login.*$user" | grep -v grep | head -1 | awk '{print $2}'); if [ ! -z "$login_pid" ]; then login_time=$(ps -o etime= -p $login_pid 2>/dev/null | tr -d ' '); if [ ! -z "$login_time" ]; then sec=$(echo $login_time | awk -F- '{d=0; if(NF==2){d=$1; $1=$2}} {split($1,t,":"); s=0; if(length(t)==3){s=t[1]*3600+t[2]*60+t[3]} else if(length(t)==2){s=t[1]*60+t[2]} else {s=t[1]}; print d*86400+s}'); if [ $sec -gt 7200 ]; then echo "WARNING: User [$user] logged in for $((sec/3600))h $((sec%3600/60))m on $tty"; fi; fi; fi; done
+EOF
+
+grep -i "^Include" /etc/zabbix_agentd.conf || echo "Include=/etc/zabbix/zabbix_agentd.d/*.conf" | tee -a /etc/zabbix_agentd.conf
+systemctl restart zabbix-agent
+
+3.2 FAIL2BAN INSTALLATION
+--------------------------
+dnf install fail2ban-server --setopt=install_weak_deps=False -y
+touch /var/log/fail2ban.log
+
+cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+banaction = nftables-multiport
+chain = input
+logtarget = /var/log/fail2ban.log
+loglevel = INFO
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/secure
+backend = systemd
+maxretry = 3
+
+[recidive]
+enabled = true
+filter = recidive
+logpath = /var/log/fail2ban.log
+bantime = 86400
+findtime = 86400
+maxretry = 2
+EOF
+
+systemctl enable --now fail2ban
+
+3.3 FAIL2BAN SELINUX
+--------------------
+chcon -t var_log_t /var/log/fail2ban.log
+
+cat > /tmp/zabbix-logs.te << 'EOF'
+module zabbix-logs 1.0;
+require {
+    type zabbix_agent_t;
+    type var_log_t;
+    class file { read open getattr };
+}
+allow zabbix_agent_t var_log_t:file { read open getattr };
+EOF
+
+checkmodule -M -m -o /tmp/zabbix-logs.mod /tmp/zabbix-logs.te
+semodule_package -o /tmp/zabbix-logs.pp -m /tmp/zabbix-logs.mod
+semodule -i /tmp/zabbix-logs.pp
+
+chgrp zabbix /var/log/fail2ban.log
+chmod 640 /var/log/fail2ban.log
+
+tee /etc/logrotate.d/fail2ban-zabbix << 'EOF'
+/var/log/fail2ban.log {
+    create 640 root zabbix
+}
+EOF
+
+systemctl restart zabbix-agent
+
+3.4 LOGIN/LOGOUT MONITORING
+----------------------------
+mkdir -p /var/log/zabbix-monitor
+chown root:zabbix /var/log/zabbix-monitor
+chmod 750 /var/log/zabbix-monitor
+
+touch /var/log/zabbix-monitor/ssh-login-success.log
+touch /var/log/zabbix-monitor/ssh-login-failed.log
+touch /var/log/zabbix-monitor/ssh-logout.log
+touch /var/log/zabbix-monitor/physical-login-failed.log
+
+chown root:zabbix /var/log/zabbix-monitor/*.log
+chmod 640 /var/log/zabbix-monitor/*.log
+restorecon -Rv /var/log/zabbix-monitor/
+
+3.5 RSYSLOG SSH MONITORING
+---------------------------
+tee /etc/rsyslog.d/50-zabbix-ssh-monitor.conf <<'EOF'
+module(load="omfile")
+
+$SystemLogRateLimitInterval 1
+$SystemLogRateLimitBurst 1000
+$RepeatedMsgReduction on
+
+template(name="ZabbixSSH" type="list") {
+    property(name="timestamp" dateFormat="rfc3339")
+    constant(value=" ")
+    property(name="hostname")
+    constant(value=" ")
+    property(name="msg" spifno1stsp="on")
+    property(name="msg" droplastlf="on")
+    constant(value="\n")
+}
+
+:programname, isequal, "sshd" {
+    if $msg contains "Accepted password for " or $msg contains "Accepted publickey for " then {
+        action(
+            type="omfile"
+            File="/var/log/zabbix-monitor/ssh-login-success.log"
+            Template="ZabbixSSH"
+            FileOwner="root"
+            FileGroup="zabbix"
+            FileCreateMode="0640"
+            CreateDirs="on"
+            Sync="off"
+            FlushOnTXEnd="on"
+            IOBufferSize="64k"
+            dynaFileCacheSize="0"
+        )
+        stop
+    }
+    
+    if $msg contains "session closed for user " then {
+        action(
+            type="omfile"
+            File="/var/log/zabbix-monitor/ssh-logout.log"
+            Template="ZabbixSSH"
+            FileOwner="root"
+            FileGroup="zabbix"
+            FileCreateMode="0640"
+            CreateDirs="on"
+            Sync="off"
+            FlushOnTXEnd="on"
+            IOBufferSize="64k"
+            dynaFileCacheSize="0"
+        )
+        stop
+    }
+    
+    if $msg contains "Failed password" or $msg contains "Invalid user" or $msg contains "Connection closed by authenticating user" then {
+        action(
+            type="omfile"
+            File="/var/log/zabbix-monitor/ssh-login-failed.log"
+            Template="ZabbixSSH"
+            FileOwner="root"
+            FileGroup="zabbix"
+            FileCreateMode="0640"
+            CreateDirs="on"
+            Sync="off"
+            FlushOnTXEnd="on"
+            IOBufferSize="64k"
+            dynaFileCacheSize="0"
+        )
+        stop
+    }
+}
+EOF
+
+3.6 RSYSLOG PHYSICAL LOGIN
+---------------------------
+tee /etc/rsyslog.d/52-zabbix-physical-login.conf <<'EOF'
+module(load="omfile")
+
+template(name="ZabbixPhysical" type="list") {
+    property(name="timestamp" dateFormat="rfc3339")
+    constant(value=" ")
+    property(name="hostname")
+    constant(value=" ")
+    property(name="msg" spifno1stsp="on")
+    property(name="msg" droplastlf="on")
+    constant(value="\n")
+}
+
+:programname, isequal, "login" {
+    if $msg contains "FAILED LOGIN" or $msg contains "authentication failure" then {
+        action(
+            type="omfile"
+            File="/var/log/zabbix-monitor/physical-login-failed.log"
+            Template="ZabbixPhysical"
+            FileOwner="root"
+            FileGroup="zabbix"
+            FileCreateMode="0640"
+            CreateDirs="on"
+            Sync="off"
+            FlushOnTXEnd="on"
+            IOBufferSize="64k"
+            dynaFileCacheSize="0"
+        )
+        stop
+    }
+}
+
+:programname, contains, "gdm" {
+    if $msg contains "authentication failure" or $msg contains "pam_unix" then {
+        action(
+            type="omfile"
+            File="/var/log/zabbix-monitor/physical-login-failed.log"
+            Template="ZabbixPhysical"
+            FileOwner="root"
+            FileGroup="zabbix"
+            FileCreateMode="0640"
+            CreateDirs="on"
+            Sync="off"
+            FlushOnTXEnd="on"
+            IOBufferSize="64k"
+            dynaFileCacheSize="0"
+        )
+        stop
+    }
+}
+
+if $msg contains "pam_unix" and $msg contains "authentication failure" and $msg contains "tty" then {
+    action(
+        type="omfile"
+        File="/var/log/zabbix-monitor/physical-login-failed.log"
+        Template="ZabbixPhysical"
+        FileOwner="root"
+        FileGroup="zabbix"
+        FileCreateMode="0640"
+        CreateDirs="on"
+        Sync="off"
+        FlushOnTXEnd="on"
+        IOBufferSize="64k"
+        dynaFileCacheSize="0"
+    )
+    stop
+}
+EOF
+
+systemctl restart rsyslog
+
+3.7 LOG CLEANUP SERVICE
+------------------------
+tee /etc/systemd/system/zabbix-log-cleanup.service <<'EOF'
+[Unit]
+Description=Clean ALL Zabbix monitoring logs on shutdown
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/bin/bash -c '\
+  echo "[$(date +%%Y-%%m-%%d %%H:%%M:%%S)] Cleaning all Zabbix logs" >> /var/log/cleanup-audit.log; \
+  find /var/log/zabbix-monitor -name "*.log" -type f -exec truncate -s 0 {} \; 2>/dev/null; \
+  [ -f /var/log/fail2ban.zabbix.log ] && truncate -s 0 /var/log/fail2ban.zabbix.log; \
+  [ -f /var/log/updates.zabbix.log ] && truncate -s 0 /var/log/updates.zabbix.log; \
+  [ -f /var/log/file_integrity.zabbix.log ] && truncate -s 0 /var/log/file_integrity.zabbix.log; \
+  echo "[$(date +%%Y-%%m-%%d %%H:%%M:%%S)] Cleanup completed" >> /var/log/cleanup-audit.log'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable zabbix-log-cleanup.service
+systemctl start zabbix-log-cleanup.service
+
+3.8 RPM MONITORING SCRIPT
+--------------------------
+tee /usr/local/bin/rpm-monitor.sh <<'EOF'
+#!/bin/bash
+LOG="/var/log/zabbix-monitor/rpm-changes.log"
+STATE="/var/lib/zabbix/rpm.state"
+TEMP="/tmp/rpm.current"
+
+mkdir -p /var/lib/zabbix
+
+rpm -qa --qf "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n" | sort > "$TEMP"
+
+if [ ! -f "$STATE" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): INITIAL: RPM monitoring initialized" >> "$LOG"
+    cp "$TEMP" "$STATE"
+    exit 0
+fi
+
+if ! diff -q "$STATE" "$TEMP" > /dev/null; then
+    comm -23 "$STATE" "$TEMP" | while read pkg; do
+        echo "$(date '+%Y-%m-%d %H:%M:%S'): REMOVED: $pkg" >> "$LOG"
+    done
+    
+    comm -13 "$STATE" "$TEMP" | while read pkg; do
+        echo "$(date '+%Y-%m-%d %H:%M:%S'): INSTALLED: $pkg" >> "$LOG"
+    done
+    
+    while read pkg; do
+        name=$(echo "$pkg" | rev | cut -d- -f3- | rev)
+        if grep -q "^${name}-" "$STATE" && [ "$pkg" != "$(grep "^${name}-" "$STATE")" ]; then
+            old_ver=$(grep "^${name}-" "$STATE")
+            echo "$(date '+%Y-%m-%d %H:%M:%S'): UPDATED: $old_ver -> $pkg" >> "$LOG"
+        fi
+    done < <(comm -13 "$STATE" "$TEMP")
+fi
+
+cp "$TEMP" "$STATE"
+rm -f "$TEMP"
+EOF
+
+chmod +x /usr/local/bin/rpm-monitor.sh
+touch /var/log/zabbix-monitor/rpm-changes.log
+chown root:zabbix /var/log/zabbix-monitor/rpm-changes.log
+chmod 640 /var/log/zabbix-monitor/rpm-changes.log
+restorecon -v /var/log/zabbix-monitor/rpm-changes.log
+echo "*/2 * * * * /usr/local/bin/rpm-monitor.sh" | crontab -
+/usr/local/bin/rpm-monitor.sh
+
+3.9 FILE INTEGRITY MONITORING
+------------------------------
+tee /usr/local/bin/file_integrity_monitoring.sh <<'EOF'
+#!/bin/bash
+LOG_FILE="/var/log/file_integrity.zabbix.log"
+STATE_DIR="/var/lib/zabbix/file_states"
+
+mkdir -p $STATE_DIR
+
+FILES=(
+    "/etc/passwd"
+    "/etc/shadow"
+    "/etc/sudoers"
+    "/etc/ssh/sshd_config"
+    "/etc/hosts"
+    "/etc/fstab"
+    "/etc/group"
+    "/root/.ssh/authorized_keys"
+)
+
+for user_home in /home/*; do
+    if [ -f "$user_home/.ssh/authorized_keys" ]; then
+        FILES+=("$user_home/.ssh/authorized_keys")
+    fi
+done
+
+LOGGED_USERS=$(who | awk '{print $1}' | sort -u | tr '\n' ',' | sed 's/,$//')
+
+for FILE in "${FILES[@]}"; do
+    if [ -f "$FILE" ]; then
+        CURRENT_HASH=$(sha256sum "$FILE" | cut -d' ' -f1)
+        CURRENT_PERMS=$(stat -c "%a" "$FILE")
+        CURRENT_OWNER=$(stat -c "%U:%G" "$FILE")
+        CURRENT_SIZE=$(stat -c "%s" "$FILE")
+        
+        STATE_BASE="$STATE_DIR/$(echo $FILE | tr '/' '_')"
+        
+        if [ -f "${STATE_BASE}.hash" ]; then
+            OLD_HASH=$(cat "${STATE_BASE}.hash" 2>/dev/null)
+            OLD_PERMS=$(cat "${STATE_BASE}.perms" 2>/dev/null)
+            OLD_OWNER=$(cat "${STATE_BASE}.owner" 2>/dev/null)
+            OLD_SIZE=$(cat "${STATE_BASE}.size" 2>/dev/null)
+            
+            DETAILS=""
+            RISKS=""
+            
+            if [ "$CURRENT_HASH" != "$OLD_HASH" ]; then
+                DETAILS="${DETAILS}CONTENT[${OLD_SIZE}b→${CURRENT_SIZE}b,SHA:${OLD_HASH:0:8}→${CURRENT_HASH:0:8}] "
+                
+                if [[ "$FILE" == "/etc/sudoers" ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:PRIVILEGE-ESCALATION "
+                elif [[ "$FILE" == "/etc/passwd" ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:USER-ACCOUNTS "
+                elif [[ "$FILE" == "/etc/shadow" ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:PASSWORDS "
+                elif [[ "$FILE" =~ authorized_keys ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:SSH-ACCESS "
+                fi
+            fi
+            
+            if [ "$CURRENT_PERMS" != "$OLD_PERMS" ]; then
+                DETAILS="${DETAILS}PERMS[${OLD_PERMS}→${CURRENT_PERMS}] "
+                
+                if [[ "$CURRENT_PERMS" =~ [24567] ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:WORLD-WRITABLE "
+                fi
+            fi
+            
+            if [ "$CURRENT_OWNER" != "$OLD_OWNER" ]; then
+                DETAILS="${DETAILS}OWNER[${OLD_OWNER}→${CURRENT_OWNER}] "
+                
+                if [[ "$CURRENT_OWNER" != "root:root" ]] && [[ "$FILE" =~ (passwd|shadow|sudoers) ]]; then
+                    RISKS="${RISKS}SECURITY-RISK:NON-ROOT-OWNER "
+                fi
+            fi
+            
+            if [ ! -z "$DETAILS" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S'): FILE-CHANGE $FILE - $DETAILS- ActiveUsers:[$LOGGED_USERS] $RISKS" >> $LOG_FILE
+            fi
+        fi
+        
+        echo "$CURRENT_HASH" > "${STATE_BASE}.hash"
+        echo "$CURRENT_PERMS" > "${STATE_BASE}.perms"
+        echo "$CURRENT_OWNER" > "${STATE_BASE}.owner"
+        echo "$CURRENT_SIZE" > "${STATE_BASE}.size"
+    fi
+done
+EOF
+
+chmod +x /usr/local/bin/file_integrity_monitoring.sh
+touch /var/log/file_integrity.zabbix.log
+chown root:zabbix /var/log/file_integrity.zabbix.log
+chmod 640 /var/log/file_integrity.zabbix.log
+chcon -t var_log_t /var/log/file_integrity.zabbix.log
+mkdir -p /var/lib/zabbix/file_states
+chmod 755 /var/lib/zabbix/file_states
+crontab -l > /tmp/cron_backup.txt
+cat << 'EOF' | crontab -
+*/2 * * * * /usr/local/bin/rpm-monitor.sh
+*/2 * * * * /usr/local/bin/file_integrity_monitoring.sh
+EOF
+/usr/local/bin/file_integrity_monitoring.sh
+
+3.10 AIDE INSTALLATION
+-----------------------
+dnf install aide -y
+mkdir -p /var/lib/aide
+mkdir -p /var/log/aide
+
+tee /etc/aide.conf <<'EOF'
+database=file:/var/lib/aide/aide.db
+database_out=file:/var/lib/aide/aide.db.new
+database_new=file:/var/lib/aide/aide.db.new
+gzip_dbout=yes
+verbose=5
+summarize_changes=yes
+report_url=file:/var/log/aide/aide.log
+
+Binlib = p+i+n+u+g+s+b+m+c+md5+sha256
+ConfFiles = p+i+n+u+g+s+b+m+c+md5+sha256
+
+/etc         ConfFiles
+/usr         Binlib
+/bin         Binlib
+/sbin        Binlib
+/lib         Binlib
+/lib64       Binlib
+/boot        ConfFiles
+/root        ConfFiles
+
+!/var/log
+!/tmp
+!/proc
+!/sys
+!/dev
+!/home
+!/var/cache
+!/var/spool
+!/var/run
+!/var/lock
+!/var/tmp
+!/var/lib/aide
+EOF
+
+aide --init
+mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+tee /usr/local/bin/aide-summary.sh <<'EOF'
+#!/bin/bash
+AIDE_LOG="/var/log/aide/aide.log"
+ZABBIX_LOG="/var/log/aide-summary.zabbix.log"
+
+aide --check > $AIDE_LOG 2>&1
+
+if grep -q "AIDE found differences" $AIDE_LOG; then
+    TOTAL=$(grep -E "^(File|Directory):" $AIDE_LOG | wc -l)
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): AIDE-SUMMARY: Total:$TOTAL files/directories changed" >> $ZABBIX_LOG
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): AIDE-SUMMARY: No changes detected" >> $ZABBIX_LOG
+fi
+EOF
+
+chmod +x /usr/local/bin/aide-summary.sh
+touch /var/log/aide-summary.zabbix.log
+chown root:zabbix /var/log/aide-summary.zabbix.log
+chmod 640 /var/log/aide-summary.zabbix.log
+chcon -t var_log_t /var/log/aide-summary.zabbix.log
+crontab -l > /tmp/current_cron.txt
+echo "0 3 * * * /usr/local/bin/aide-summary.sh" >> /tmp/current_cron.txt
+cat /tmp/current_cron.txt | crontab -
+
+================================================================================
+SECTION 4: MATRIX INTEGRATION
+================================================================================
+
+4.1 MATRIX SECRETS
+------------------
+mkdir -p /etc/zabbix/secret.d
+
+tee /etc/zabbix/secret.d/matrix.ini <<'EOF'
+[server]
+base_url = https://matrix.tchncs.de
+access_token = [YOUR_MATRIX_ACCESS_TOKEN]
+
+[rooms]
+pc_down         = [ROOM_ID_PC_DOWN]
+login_events    = [ROOM_ID_LOGIN_EVENTS]
+login_failures  = [ROOM_ID_LOGIN_FAILURES]
+long_sessions   = [ROOM_ID_LONG_SESSIONS]
+resource_usage  = [ROOM_ID_RESOURCE_USAGE]
+disk_space      = [ROOM_ID_DISK_SPACE]
+network_traffic = [ROOM_ID_NETWORK_TRAFFIC]
+updates         = [ROOM_ID_UPDATES]
+file_integrity  = [ROOM_ID_FILE_INTEGRITY]
+weekly_reports  = [ROOM_ID_WEEKLY_REPORTS]
+default         = [ROOM_ID_DEFAULT]
+EOF
+
+chown zabbix:zabbix /etc/zabbix/secret.d/matrix.ini
+chmod 0640 /etc/zabbix/secret.d/matrix.ini
+
+4.2 MATRIX SMART SCRIPT
+------------------------
+mkdir -p /var/lib/zabbixsrv/alertscripts
+chmod 755 /var/lib/zabbixsrv/alertscripts
+
+tee /var/lib/zabbixsrv/alertscripts/matrix_smart.py <<'EOF'
+#!/usr/bin/env python3
+import sys, json, urllib.request, configparser, html
+from datetime import datetime
+
+INI = '/etc/zabbix/secret.d/matrix.ini'
+cfg = configparser.ConfigParser();  cfg.read(INI)
+MATRIX_SERVER = (cfg['server'].get('base_url') or cfg['server'].get('MATRIX_SERVER')).rstrip('/')
+MATRIX_TOKEN  = (cfg['server'].get('access_token') or cfg['server'].get('MATRIX_TOKEN')).strip()
+ROOMS = {k.lower(): v.strip() for k,v in cfg['rooms'].items()}
+DEFAULT_ROOM = ROOMS.get('default')
+
+def pick_usecase(subject, message, route_tag=None):
+    text = f"{subject} {message}".lower()
+    if route_tag: return route_tag.lower()
+    kw = [
+      ('pc_down', ['not available','unreachable','timeout','link down']),
+      ('login_failures', ['failed password','authentication failure','ssh login failed','fail2ban found']),
+      ('login_events', ['ssh login','accepted password','logout','session opened','session closed']),
+      ('long_sessions', ['logged in over','long session']),
+      ('disk_space', ['space is low','free inodes','read-only','disk']),
+      ('resource_usage', ['high cpu','memory utilization','swap','process limit','load average']),
+      ('network_traffic', ['bandwidth','error rate','lower speed','interface']),
+      ('updates', ['package installed','removed','updated']),
+      ('file_integrity', ['file integrity','checksum','/etc/passwd']),
+      ('weekly_reports', ['weekly report'])
+    ]
+    for key, words in kw:
+        if any(w in text for w in words): return key
+    return 'default'
+
+def determine_room(subject, message):
+    route_tag = None
+    for line in message.splitlines():
+        if line.lower().startswith('tags:'):
+            parts = line.split(':',1)[1].split(';')
+            for p in parts:
+                if '=' in p:
+                    k,v = p.strip().split('=',1)
+                    if k.strip().lower()=='route': route_tag=v.strip()
+    uc = pick_usecase(subject, message, route_tag)
+    return ROOMS.get(uc, DEFAULT_ROOM)
+
+def send_matrix(room_id, subject, message):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    body = f"ZABBIX ALERT\n\n[{ts}]\n\nSUBJECT: {subject}\n\n{message}"
+    data = json.dumps({
+      "msgtype":"m.text",
+      "body": body,
+      "format":"org.matrix.custom.html",
+      "formatted_body": f"<h3>ZABBIX ALERT</h3><p><b>[{ts}]</b></p><p><b>SUBJECT:</b> {html.escape(subject)}</p><pre>{html.escape(message)}</pre>"
+    }).encode('utf-8')
+    url = f"{MATRIX_SERVER}/_matrix/client/r0/rooms/{room_id}/send/m.room.message"
+    req = urllib.request.Request(url, data=data,
+          headers={"Authorization":f"Bearer {MATRIX_TOKEN}","Content-Type":"application/json"}, method='POST')
+    with urllib.request.urlopen(req, timeout=15) as r: return 200 <= r.status < 300
+
+def main():
+    if len(sys.argv) < 4: sys.exit(1)
+    _, to, subject, message = sys.argv
+    room = determine_room(subject, message)
+    ok = send_matrix(room, subject, message)
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__": main()
+EOF
+
+chown zabbix:zabbix /var/lib/zabbixsrv/alertscripts/matrix_smart.py
+chmod 0755 /var/lib/zabbixsrv/alertscripts/matrix_smart.py
+
+4.3 API CONFIGURATION
+---------------------
+echo "[YOUR_SERVER_IP]   monitor.local" | tee -a /etc/hosts
+mkdir -p /etc/nginx/ssl
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/zabbix.key \
+  -out /etc/nginx/ssl/zabbix.crt \
+  -subj "/C=DE/ST=NRW/L=Cologne/O=HomeNetwork/OU=IT/CN=monitor.local" \
+  -addext "subjectAltName=DNS:monitor.local,IP:[YOUR_SERVER_IP]"
+sed -i 's/^\(\s*server_name\s*\)_;/\1monitor.local;/' /etc/nginx/conf.d/zabbix.conf
+nginx -t && systemctl reload nginx
+
+tee /etc/zabbix/secret.d/zabbix_api.ini <<'EOF'
+[zabbix]
+url = https://monitor.local/api_jsonrpc.php
+token = [YOUR_ZABBIX_API_TOKEN]
+verify_tls = true
+cafile = /etc/nginx/ssl/zabbix.crt
+EOF
+
+chown zabbix:zabbix /etc/zabbix/secret.d/zabbix_api.ini
+chmod 0640 /etc/zabbix/secret.d/zabbix_api.ini
+
+4.4 WEEKLY REPORT SCRIPT
+-------------------------
+[Content of weekly report script - see previous sections for full content]
+
+chown zabbix:zabbix /var/lib/zabbixsrv/alertscripts/zabbix_weekly_report.py
+chmod 0755 /var/lib/zabbixsrv/alertscripts/zabbix_weekly_report.py
+
+4.5 WEEKLY REPORT CRON
+----------------------
+touch /var/log/zabbix/weekly_report.log
+chown zabbix:zabbix /var/log/zabbix/weekly_report.log
+# Add to zabbix crontab:
+# 0 8 * * MON /usr/bin/python3 /var/lib/zabbixsrv/alertscripts/zabbix_weekly_report.py >> /var/log/zabbix/weekly_report.log 2>&1
+

@@ -1,0 +1,46 @@
+[Unit]
+Description=Clean ALL Zabbix monitoring logs on shutdown
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+After=rsyslog.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/bin/bash -c '\
+  echo "[$(date +%%Y-%%m-%%d %%H:%%M:%%S)] Starting Zabbix log cleanup" >> /var/log/cleanup-audit.log; \
+  \
+  # Zabbix-Monitor Verzeichnis Logs \
+  echo "Cleaning /var/log/zabbix-monitor/ logs..." >> /var/log/cleanup-audit.log; \
+  [ -f /var/log/zabbix-monitor/ssh-login-success.log ] && truncate -s 0 /var/log/zabbix-monitor/ssh-login-success.log; \
+  [ -f /var/log/zabbix-monitor/ssh-logout.log ] && truncate -s 0 /var/log/zabbix-monitor/ssh-logout.log; \
+  [ -f /var/log/zabbix-monitor/ssh-login-failed.log ] && truncate -s 0 /var/log/zabbix-monitor/ssh-login-failed.log; \
+  [ -f /var/log/zabbix-monitor/physical-login-failed.log ] && truncate -s 0 /var/log/zabbix-monitor/physical-login-failed.log; \
+  [ -f /var/log/zabbix-monitor/rpm-changes.log ] && truncate -s 0 /var/log/zabbix-monitor/rpm-changes.log; \
+  \
+  # File Integrity Logs \
+  echo "Cleaning file integrity logs..." >> /var/log/cleanup-audit.log; \
+  [ -f /var/log/file_integrity.zabbix.log ] && truncate -s 0 /var/log/file_integrity.zabbix.log; \
+  [ -f /var/log/aide-summary.zabbix.log ] && truncate -s 0 /var/log/aide-summary.zabbix.log; \
+  \
+  # Fail2ban Log \
+  echo "Cleaning fail2ban log..." >> /var/log/cleanup-audit.log; \
+  [ -f /var/log/fail2ban.log ] && truncate -s 0 /var/log/fail2ban.log; \
+  \
+  # Updates Log (falls vorhanden) \
+  [ -f /var/log/updates.zabbix.log ] && truncate -s 0 /var/log/updates.zabbix.log; \
+  \
+  # Alle anderen .zabbix.log Dateien \
+  find /var/log -name "*.zabbix.log" -type f -exec truncate -s 0 {} \; 2>/dev/null; \
+  \
+  # State Files für File Integrity Monitoring zurücksetzen (optional) \
+  [ -d /var/lib/zabbix/file_states ] && rm -f /var/lib/zabbix/file_states/* 2>/dev/null; \
+  [ -f /var/lib/zabbix/rpm.state ] && rm -f /var/lib/zabbix/rpm.state 2>/dev/null; \
+  \
+  echo "[$(date +%%Y-%%m-%%d %%H:%%M:%%S)] Cleanup completed successfully" >> /var/log/cleanup-audit.log'
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target shutdown.target
